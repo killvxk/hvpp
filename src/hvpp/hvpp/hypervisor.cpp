@@ -4,6 +4,7 @@
 #include "ia32/cpuid/cpuid_eax_01.h"
 #include "lib/assert.h"
 #include "lib/log.h"
+#include "lib/mm.h"
 #include "lib/mp.h"
 
 #ifdef HVPP_SINGLE_VCPU
@@ -24,7 +25,7 @@ namespace hvpp {
 auto hypervisor::initialize() noexcept -> error_code_t
 {
   vcpu_list_ = new vcpu_t[mp::cpu_count()];
-  handler_ = nullptr;
+  exit_handler_ = nullptr;
   check_passed_ = false;
   started_ = false;
 
@@ -43,6 +44,11 @@ auto hypervisor::initialize() noexcept -> error_code_t
 
 void hypervisor::destroy() noexcept
 {
+  if (started_)
+  {
+    stop();
+  }
+
   if (vcpu_list_)
   {
     delete[] vcpu_list_;
@@ -52,12 +58,22 @@ void hypervisor::destroy() noexcept
   }
 }
 
-void hypervisor::start(vmexit_handler* handler) noexcept
+auto hypervisor::start(vmexit_handler& handler) noexcept -> error_code_t
 {
-  hvpp_assert(vcpu_list_ && check_passed_ && handler);
+  hvpp_assert(vcpu_list_ && check_passed_);
   hvpp_assert(!started_);
 
-  handler_ = handler;
+  if (!vcpu_list_ || !check_passed_)
+  {
+    return make_error_code_t(std::errc::invalid_argument);
+  }
+
+  if (started_)
+  {
+    return make_error_code_t(std::errc::operation_not_permitted);
+  }
+
+  exit_handler_ = &handler;
 
 #ifdef HVPP_SINGLE_VCPU
   single_cpu_call(start_ipi_callback);
@@ -66,6 +82,8 @@ void hypervisor::start(vmexit_handler* handler) noexcept
 #endif
 
   started_ = true;
+
+  return error_code_t{};
 }
 
 void hypervisor::stop() noexcept
@@ -89,6 +107,11 @@ void hypervisor::stop() noexcept
 bool hypervisor::is_started() const noexcept
 {
   return started_;
+}
+
+auto hypervisor::exit_handler() noexcept -> vmexit_handler&
+{
+  return *exit_handler_;
 }
 
 //
@@ -156,13 +179,17 @@ void hypervisor::start_ipi_callback() noexcept
   //   - error handling
   //   - create new error_category for VMX errors
   //
+  memory_manager::allocator_guard _;
+
   auto idx = mp::cpu_index();
-  vcpu_list_[idx].initialize(handler_);
+  vcpu_list_[idx].initialize(*exit_handler_);
   vcpu_list_[idx].launch();
 }
 
 void hypervisor::stop_ipi_callback() noexcept
 {
+  memory_manager::allocator_guard _;
+
   auto idx = mp::cpu_index();
   vcpu_list_[idx].destroy();
 }

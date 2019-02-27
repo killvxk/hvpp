@@ -108,7 +108,7 @@ namespace driver
     //
     // Start the hypervisor.
     //
-    hypervisor_->start(vmexit_handler_);
+    hypervisor_->start(*vmexit_handler_);
 
     //
     // Tell debugger we're started.
@@ -126,6 +126,10 @@ namespace driver
     //
     if (hypervisor_)
     {
+      //
+      // Stopping the hypervisor is not strictly needed here -
+      // the destroy() method stops the hypervisor if necessary.
+      //
       if (hypervisor_->is_started())
       {
         hypervisor_->stop();

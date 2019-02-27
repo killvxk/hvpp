@@ -15,11 +15,13 @@ class vmexit_passthrough_handler
 {
   public:
     void setup(vcpu_t& vp) noexcept override;
-    void invoke_termination() noexcept override;
+    void invoke_termination(vcpu_t& vp) noexcept override;
 
   protected:
     void handle_exception_or_nmi(vcpu_t& vp) noexcept override;
+    void handle_external_interrupt(vcpu_t& vp) noexcept override;
     void handle_triple_fault(vcpu_t& vp) noexcept override;
+    void handle_interrupt_window(vcpu_t& vp) noexcept override;
     void handle_execute_cpuid(vcpu_t& vp) noexcept override;
     void handle_execute_invd(vcpu_t& vp) noexcept override;
     void handle_execute_invlpg(vcpu_t& vp) noexcept override;
@@ -54,7 +56,12 @@ class vmexit_passthrough_handler
     void handle_execute_invvpid(vcpu_t& vp) noexcept override;
     void handle_execute_vmfunc(vcpu_t& vp) noexcept override;
 
-    void handle_vm_fallback(vcpu_t& vp) noexcept;
+    void handle_vm_fallback(vcpu_t& vp) noexcept override;
+
+    virtual void handle_interrupt(vcpu_t& vp) noexcept;
+
+    virtual void handle_emulate_syscall(vcpu_t& vp) noexcept;
+    virtual void handle_emulate_sysret(vcpu_t& vp) noexcept;
 };
 
 }

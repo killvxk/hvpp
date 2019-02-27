@@ -1,6 +1,6 @@
 namespace hvpp {
 
-auto vcpu_t::exit_interrupt_info() const noexcept -> interrupt_info_t
+auto vcpu_t::interrupt_info() const noexcept -> interrupt_info_t
 {
   interrupt_info_t result;
   result.info_ = exit_interruption_info();
@@ -18,7 +18,93 @@ auto vcpu_t::exit_interrupt_info() const noexcept -> interrupt_info_t
   return result;
 }
 
-void vcpu_t::inject(interrupt_info_t interrupt) noexcept
+auto vcpu_t::idt_vectoring_info() const noexcept -> interrupt_info_t
+{
+  interrupt_info_t result;
+  result.info_ = exit_idt_vectoring_info();
+
+  if (result.info_.valid)
+  {
+    if (result.info_.error_code_valid)
+    {
+      result.error_code_ = exit_idt_vectoring_error_code();
+    }
+
+    result.rip_adjust_ = exit_instruction_length();
+  }
+
+  return result;
+}
+
+bool vcpu_t::interrupt_inject(interrupt_info_t interrupt, bool first /*= false */) noexcept
+{
+  //
+  // Check the interruptibility state of the guest.
+  // We have to delay the injection if the guest is
+  // not interruptible (e.g.: guest is blocked by
+  // "mov ss", or EFLAGS.IF == 0).
+  //
+  if (auto interruptibility_state = guest_interruptibility_state();
+           interruptibility_state.flags ||
+           !exit_context_.rflags.interrupt_enable_flag)
+  {
+    //
+    // Make sure there aren't too much pending interrupts.
+    // We don't want the queue to overflow.
+    //
+    hvpp_assert(pending_interrupt_count_ < pending_interrupt_queue_size);
+
+    if (first)
+    {
+      //
+      // Enqueue pending interrupt ("push_front").
+      //
+      pending_interrupt_first_ = !pending_interrupt_first_
+        ? pending_interrupt_queue_size - 1
+        : pending_interrupt_first_ - 1;
+
+      pending_interrupt_[pending_interrupt_first_] = interrupt;
+      pending_interrupt_count_ += 1;
+    }
+    else
+    {
+      //
+      // Enqueue pending interrupt ("push_back").
+      //
+      auto index = (pending_interrupt_first_ + pending_interrupt_count_) % pending_interrupt_queue_size;
+
+      pending_interrupt_[index] = interrupt;
+      pending_interrupt_count_ += 1;
+    }
+
+    //
+    // Enable Interrupt-window exiting.
+    //
+    auto procbased_ctls = processor_based_controls();
+    procbased_ctls.interrupt_window_exiting = true;
+    processor_based_controls(procbased_ctls);
+
+    //
+    // "false" signalizes that the interrupt hasn't been
+    // immediately injected.
+    //
+    return false;
+  }
+  else
+  {
+    //
+    // Inject interrupt immediately.
+    //
+    interrupt_inject_force(interrupt);
+
+    //
+    // Signalize immediately injected interrupt.
+    //
+    return true;
+  }
+}
+
+void vcpu_t::interrupt_inject_force(interrupt_info_t interrupt) noexcept
 {
   entry_interruption_info(interrupt.info_);
 
@@ -111,6 +197,37 @@ void vcpu_t::inject(interrupt_info_t interrupt) noexcept
         break;
     }
   }
+}
+
+void vcpu_t::interrupt_inject_pending() noexcept
+{
+  //
+  // Make sure there is at least 1 pending interrupt.
+  //
+  hvpp_assert(
+    interrupt_is_pending()   &&
+    pending_interrupt_count_ <= pending_interrupt_queue_size
+  );
+
+  //
+  // Dequeue pending interrupt ("pop_front").
+  //
+  auto interrupt = pending_interrupt_[pending_interrupt_first_];
+
+  pending_interrupt_first_ += 1;
+  pending_interrupt_count_ -= 1;
+
+  if (!pending_interrupt_count_ || pending_interrupt_first_ == pending_interrupt_queue_size)
+  {
+    pending_interrupt_first_ = 0;
+  }
+
+  interrupt_inject_force(interrupt);
+}
+
+bool vcpu_t::interrupt_is_pending() const noexcept
+{
+  return pending_interrupt_count_ > 0;
 }
 
 auto vcpu_t::exit_instruction_info_guest_va() const noexcept -> void*
@@ -424,6 +541,20 @@ auto vcpu_t::exit_interruption_error_code() const noexcept -> exception_error_co
   return result;
 }
 
+auto vcpu_t::exit_idt_vectoring_info() const noexcept -> vmx::interrupt_info_t
+{
+  vmx::interrupt_info_t result;
+  vmx::vmread(vmx::vmcs_t::field::vmexit_idt_vectoring_info, result);
+  return result;
+}
+
+auto vcpu_t::exit_idt_vectoring_error_code() const noexcept -> exception_error_code_t
+{
+  exception_error_code_t result;
+  vmx::vmread(vmx::vmcs_t::field::vmexit_idt_vectoring_error_code, result);
+  return result;
+}
+
 auto vcpu_t::exit_reason() const noexcept -> vmx::exit_reason
 {
   vmx::exit_reason result;
@@ -445,9 +576,9 @@ auto vcpu_t::exit_guest_physical_address() const noexcept -> pa_t
   return result;
 }
 
-auto vcpu_t::exit_guest_linear_address() const noexcept -> la_t
+auto vcpu_t::exit_guest_linear_address() const noexcept -> va_t
 {
-  la_t result;
+  va_t result;
   vmx::vmread(vmx::vmcs_t::field::vmexit_guest_linear_address, result);
   return result;
 }
@@ -581,9 +712,9 @@ void vcpu_t::guest_idtr(idtr_t idtr) noexcept
   vmx::vmwrite(vmx::vmcs_t::field::guest_idtr_limit, idtr.limit);
 }
 
-auto vcpu_t::guest_cs() const noexcept -> seg_t<cs_t>
+auto vcpu_t::guest_cs() const noexcept -> segment_t<cs_t>
 {
-  seg_t<cs_t> cs;
+  segment_t<cs_t> cs;
   vmx::vmread(vmx::vmcs_t::field::guest_cs_base, cs.base_address);
   vmx::vmread(vmx::vmcs_t::field::guest_cs_limit, cs.limit);
   vmx::vmread(vmx::vmcs_t::field::guest_cs_access_rights, cs.access);
@@ -591,7 +722,7 @@ auto vcpu_t::guest_cs() const noexcept -> seg_t<cs_t>
   return cs;
 }
 
-void vcpu_t::guest_cs(seg_t<cs_t> cs) noexcept
+void vcpu_t::guest_cs(segment_t<cs_t> cs) noexcept
 {
   vmx::vmwrite(vmx::vmcs_t::field::guest_cs_base, cs.base_address /* 0 */);
   vmx::vmwrite(vmx::vmcs_t::field::guest_cs_limit, cs.limit);
@@ -599,9 +730,9 @@ void vcpu_t::guest_cs(seg_t<cs_t> cs) noexcept
   vmx::vmwrite(vmx::vmcs_t::field::guest_cs_selector, cs.selector);
 }
 
-auto vcpu_t::guest_ds() const noexcept -> seg_t<ds_t>
+auto vcpu_t::guest_ds() const noexcept -> segment_t<ds_t>
 {
-  seg_t<ds_t> ds;
+  segment_t<ds_t> ds;
   vmx::vmread(vmx::vmcs_t::field::guest_ds_base, ds.base_address);
   vmx::vmread(vmx::vmcs_t::field::guest_ds_limit, ds.limit);
   vmx::vmread(vmx::vmcs_t::field::guest_ds_access_rights, ds.access);
@@ -610,7 +741,7 @@ auto vcpu_t::guest_ds() const noexcept -> seg_t<ds_t>
   return ds;
 }
 
-void vcpu_t::guest_ds(seg_t<ds_t> ds) noexcept
+void vcpu_t::guest_ds(segment_t<ds_t> ds) noexcept
 {
   vmx::vmwrite(vmx::vmcs_t::field::guest_ds_base, ds.base_address /* 0 */);
   vmx::vmwrite(vmx::vmcs_t::field::guest_ds_limit, ds.limit);
@@ -618,9 +749,9 @@ void vcpu_t::guest_ds(seg_t<ds_t> ds) noexcept
   vmx::vmwrite(vmx::vmcs_t::field::guest_ds_selector, ds.selector);
 }
 
-auto vcpu_t::guest_es() const noexcept -> seg_t<es_t>
+auto vcpu_t::guest_es() const noexcept -> segment_t<es_t>
 {
-  seg_t<es_t> es;
+  segment_t<es_t> es;
   vmx::vmread(vmx::vmcs_t::field::guest_es_base, es.base_address);
   vmx::vmread(vmx::vmcs_t::field::guest_es_limit, es.limit);
   vmx::vmread(vmx::vmcs_t::field::guest_es_access_rights, es.access);
@@ -629,7 +760,7 @@ auto vcpu_t::guest_es() const noexcept -> seg_t<es_t>
   return es;
 }
 
-void vcpu_t::guest_es(seg_t<es_t> es) noexcept
+void vcpu_t::guest_es(segment_t<es_t> es) noexcept
 {
   vmx::vmwrite(vmx::vmcs_t::field::guest_es_base, es.base_address /* 0 */);
   vmx::vmwrite(vmx::vmcs_t::field::guest_es_limit, es.limit);
@@ -637,9 +768,9 @@ void vcpu_t::guest_es(seg_t<es_t> es) noexcept
   vmx::vmwrite(vmx::vmcs_t::field::guest_es_selector, es.selector);
 }
 
-auto vcpu_t::guest_fs() const noexcept -> seg_t<fs_t>
+auto vcpu_t::guest_fs() const noexcept -> segment_t<fs_t>
 {
-  seg_t<fs_t> fs;
+  segment_t<fs_t> fs;
   vmx::vmread(vmx::vmcs_t::field::guest_fs_base, fs.base_address);
   vmx::vmread(vmx::vmcs_t::field::guest_fs_limit, fs.limit);
   vmx::vmread(vmx::vmcs_t::field::guest_fs_access_rights, fs.access);
@@ -648,7 +779,7 @@ auto vcpu_t::guest_fs() const noexcept -> seg_t<fs_t>
   return fs;
 }
 
-void vcpu_t::guest_fs(seg_t<fs_t> fs) noexcept
+void vcpu_t::guest_fs(segment_t<fs_t> fs) noexcept
 {
   vmx::vmwrite(vmx::vmcs_t::field::guest_fs_base, fs.base_address);
   vmx::vmwrite(vmx::vmcs_t::field::guest_fs_limit, fs.limit);
@@ -656,9 +787,9 @@ void vcpu_t::guest_fs(seg_t<fs_t> fs) noexcept
   vmx::vmwrite(vmx::vmcs_t::field::guest_fs_selector, fs.selector);
 }
 
-auto vcpu_t::guest_gs() const noexcept -> seg_t<gs_t>
+auto vcpu_t::guest_gs() const noexcept -> segment_t<gs_t>
 {
-  seg_t<gs_t> gs;
+  segment_t<gs_t> gs;
   vmx::vmread(vmx::vmcs_t::field::guest_gs_base, gs.base_address);
   vmx::vmread(vmx::vmcs_t::field::guest_gs_limit, gs.limit);
   vmx::vmread(vmx::vmcs_t::field::guest_gs_access_rights, gs.access);
@@ -667,7 +798,7 @@ auto vcpu_t::guest_gs() const noexcept -> seg_t<gs_t>
   return gs;
 }
 
-void vcpu_t::guest_gs(seg_t<gs_t> gs) noexcept
+void vcpu_t::guest_gs(segment_t<gs_t> gs) noexcept
 {
   vmx::vmwrite(vmx::vmcs_t::field::guest_gs_base, gs.base_address);
   vmx::vmwrite(vmx::vmcs_t::field::guest_gs_limit, gs.limit);
@@ -675,9 +806,9 @@ void vcpu_t::guest_gs(seg_t<gs_t> gs) noexcept
   vmx::vmwrite(vmx::vmcs_t::field::guest_gs_selector, gs.selector);
 }
 
-auto vcpu_t::guest_ss() const noexcept -> seg_t<ss_t>
+auto vcpu_t::guest_ss() const noexcept -> segment_t<ss_t>
 {
-  seg_t<ss_t> ss;
+  segment_t<ss_t> ss;
   vmx::vmread(vmx::vmcs_t::field::guest_ss_base, ss.base_address);
   vmx::vmread(vmx::vmcs_t::field::guest_ss_limit, ss.limit);
   vmx::vmread(vmx::vmcs_t::field::guest_ss_access_rights, ss.access);
@@ -686,7 +817,7 @@ auto vcpu_t::guest_ss() const noexcept -> seg_t<ss_t>
   return ss;
 }
 
-void vcpu_t::guest_ss(seg_t<ss_t> ss) noexcept
+void vcpu_t::guest_ss(segment_t<ss_t> ss) noexcept
 {
   vmx::vmwrite(vmx::vmcs_t::field::guest_ss_base, ss.base_address /* 0 */);
   vmx::vmwrite(vmx::vmcs_t::field::guest_ss_limit, ss.limit);
@@ -694,9 +825,9 @@ void vcpu_t::guest_ss(seg_t<ss_t> ss) noexcept
   vmx::vmwrite(vmx::vmcs_t::field::guest_ss_selector, ss.selector);
 }
 
-auto vcpu_t::guest_tr() const noexcept -> seg_t<tr_t>
+auto vcpu_t::guest_tr() const noexcept -> segment_t<tr_t>
 {
-  seg_t<tr_t> tr;
+  segment_t<tr_t> tr;
   vmx::vmread(vmx::vmcs_t::field::guest_tr_base, tr.base_address);
   vmx::vmread(vmx::vmcs_t::field::guest_tr_limit, tr.limit);
   vmx::vmread(vmx::vmcs_t::field::guest_tr_access_rights, tr.access);
@@ -705,7 +836,7 @@ auto vcpu_t::guest_tr() const noexcept -> seg_t<tr_t>
   return tr;
 }
 
-void vcpu_t::guest_tr(seg_t<tr_t> tr) noexcept
+void vcpu_t::guest_tr(segment_t<tr_t> tr) noexcept
 {
   vmx::vmwrite(vmx::vmcs_t::field::guest_tr_base, tr.base_address);
   vmx::vmwrite(vmx::vmcs_t::field::guest_tr_limit, tr.limit);
@@ -713,9 +844,9 @@ void vcpu_t::guest_tr(seg_t<tr_t> tr) noexcept
   vmx::vmwrite(vmx::vmcs_t::field::guest_tr_selector, tr.selector);
 }
 
-auto vcpu_t::guest_ldtr() const noexcept -> seg_t<ldtr_t>
+auto vcpu_t::guest_ldtr() const noexcept -> segment_t<ldtr_t>
 {
-  seg_t<ldtr_t> ldtr;
+  segment_t<ldtr_t> ldtr;
   vmx::vmread(vmx::vmcs_t::field::guest_ldtr_base, ldtr.base_address);
   vmx::vmread(vmx::vmcs_t::field::guest_ldtr_limit, ldtr.limit);
   vmx::vmread(vmx::vmcs_t::field::guest_ldtr_access_rights, ldtr.access);
@@ -724,7 +855,7 @@ auto vcpu_t::guest_ldtr() const noexcept -> seg_t<ldtr_t>
   return ldtr;
 }
 
-void vcpu_t::guest_ldtr(seg_t<ldtr_t> ldtr) noexcept
+void vcpu_t::guest_ldtr(segment_t<ldtr_t> ldtr) noexcept
 {
   vmx::vmwrite(vmx::vmcs_t::field::guest_ldtr_base, ldtr.base_address);
   vmx::vmwrite(vmx::vmcs_t::field::guest_ldtr_limit, ldtr.limit);
@@ -756,35 +887,35 @@ void vcpu_t::guest_segment_limit(int index, uint32_t limit) noexcept
   vmx::vmwrite(vmx::vmcs_t::field::guest_es_limit + (index << 1), limit);
 }
 
-auto vcpu_t::guest_segment_access(int index) const noexcept -> seg_access_vmx_t
+auto vcpu_t::guest_segment_access(int index) const noexcept -> segment_access_vmx_t
 {
-  seg_access_vmx_t result;
+  segment_access_vmx_t result;
   vmx::vmread(vmx::vmcs_t::field::guest_es_access_rights + (index << 1), result);
   return result;
 }
 
-void vcpu_t::guest_segment_access(int index, seg_access_vmx_t access_rights) noexcept
+void vcpu_t::guest_segment_access(int index, segment_access_vmx_t access_rights) noexcept
 {
   vmx::vmwrite(vmx::vmcs_t::field::guest_es_access_rights + (index << 1), access_rights);
 }
 
-auto vcpu_t::guest_segment_selector(int index) const noexcept -> seg_selector_t
+auto vcpu_t::guest_segment_selector(int index) const noexcept -> segment_selector_t
 {
-  seg_selector_t result;
+  segment_selector_t result;
   vmx::vmread(vmx::vmcs_t::field::guest_es_selector + (index << 1), result);
   return result;
 }
 
-void vcpu_t::guest_segment_selector(int index, seg_selector_t selector) noexcept
+void vcpu_t::guest_segment_selector(int index, segment_selector_t selector) noexcept
 {
   vmx::vmwrite(vmx::vmcs_t::field::guest_es_selector + (index << 1), selector);
 }
 
-auto vcpu_t::guest_segment(int index) const noexcept -> seg_t<>
+auto vcpu_t::guest_segment(int index) const noexcept -> segment_t<>
 {
   hvpp_assert(index >= context_t::seg_min && index <= context_t::seg_max);
 
-  return seg_t<> {
+  return segment_t<> {
     guest_segment_base_address(index),
     guest_segment_limit(index),
     guest_segment_access(index),
@@ -792,7 +923,7 @@ auto vcpu_t::guest_segment(int index) const noexcept -> seg_t<>
   };
 }
 
-void vcpu_t::guest_segment(int index, seg_t<> seg) noexcept
+void vcpu_t::guest_segment(int index, segment_t<> seg) noexcept
 {
   hvpp_assert(index >= context_t::seg_min && index <= context_t::seg_max);
 
@@ -800,6 +931,18 @@ void vcpu_t::guest_segment(int index, seg_t<> seg) noexcept
   guest_segment_limit(index, seg.limit);
   guest_segment_access(index, seg.access);
   guest_segment_selector(index, seg.selector);
+}
+
+auto vcpu_t::guest_interruptibility_state() const noexcept -> vmx::interruptibility_state_t
+{
+  vmx::interruptibility_state_t interruptibility_state;
+  vmx::vmread(vmx::vmcs_t::field::guest_interruptibility_state, interruptibility_state);
+  return interruptibility_state;
+}
+
+void vcpu_t::guest_interruptibility_state(vmx::interruptibility_state_t interruptibility_state) noexcept
+{
+  vmx::vmwrite(vmx::vmcs_t::field::guest_interruptibility_state, interruptibility_state);
 }
 
 //
@@ -919,91 +1062,91 @@ void vcpu_t::host_idtr(idtr_t idtr) noexcept
 //   (selector.flags & 0b0111)
 //
 
-auto vcpu_t::host_cs() const noexcept -> seg_t<cs_t>
+auto vcpu_t::host_cs() const noexcept -> segment_t<cs_t>
 {
-  seg_t<cs_t> cs;
+  segment_t<cs_t> cs;
   vmx::vmread(vmx::vmcs_t::field::host_cs_selector, cs.selector);
   return cs;
 }
 
-void vcpu_t::host_cs(seg_t<cs_t> cs) noexcept
+void vcpu_t::host_cs(segment_t<cs_t> cs) noexcept
 {
   vmx::vmwrite(vmx::vmcs_t::field::host_cs_selector, cs.selector.index * 8);
 }
 
-auto vcpu_t::host_ds() const noexcept -> seg_t<ds_t>
+auto vcpu_t::host_ds() const noexcept -> segment_t<ds_t>
 {
-  seg_t<ds_t> ds;
+  segment_t<ds_t> ds;
   vmx::vmread(vmx::vmcs_t::field::host_ds_selector, ds.selector);
   return ds;
 }
 
-void vcpu_t::host_ds(seg_t<ds_t> ds) noexcept
+void vcpu_t::host_ds(segment_t<ds_t> ds) noexcept
 {
   vmx::vmwrite(vmx::vmcs_t::field::host_ds_selector, ds.selector.index * 8);
 }
 
-auto vcpu_t::host_es() const noexcept -> seg_t<es_t>
+auto vcpu_t::host_es() const noexcept -> segment_t<es_t>
 {
-  seg_t<es_t> es;
+  segment_t<es_t> es;
   vmx::vmread(vmx::vmcs_t::field::host_es_selector, es.selector);
   return es;
 }
 
-void vcpu_t::host_es(seg_t<es_t> es) noexcept
+void vcpu_t::host_es(segment_t<es_t> es) noexcept
 {
   vmx::vmwrite(vmx::vmcs_t::field::host_es_selector, es.selector.index * 8);
 }
 
-auto vcpu_t::host_fs() const noexcept -> seg_t<fs_t>
+auto vcpu_t::host_fs() const noexcept -> segment_t<fs_t>
 {
-  seg_t<fs_t> fs;
+  segment_t<fs_t> fs;
   vmx::vmread(vmx::vmcs_t::field::host_fs_selector, fs.selector);
   vmx::vmread(vmx::vmcs_t::field::host_fs_base, fs.base_address);
   return fs;
 }
 
-void vcpu_t::host_fs(seg_t<fs_t> fs) noexcept
+void vcpu_t::host_fs(segment_t<fs_t> fs) noexcept
 {
   vmx::vmwrite(vmx::vmcs_t::field::host_fs_selector, fs.selector.index * 8);
   vmx::vmwrite(vmx::vmcs_t::field::host_fs_base, fs.base_address);
 }
 
-auto vcpu_t::host_gs() const noexcept -> seg_t<gs_t>
+auto vcpu_t::host_gs() const noexcept -> segment_t<gs_t>
 {
-  seg_t<gs_t> gs;
+  segment_t<gs_t> gs;
   vmx::vmread(vmx::vmcs_t::field::host_gs_selector, gs.selector);
   vmx::vmread(vmx::vmcs_t::field::host_gs_base, gs.base_address);
   return gs;
 }
 
-void vcpu_t::host_gs(seg_t<gs_t> gs) noexcept
+void vcpu_t::host_gs(segment_t<gs_t> gs) noexcept
 {
   vmx::vmwrite(vmx::vmcs_t::field::host_gs_selector, gs.selector.index * 8);
   vmx::vmwrite(vmx::vmcs_t::field::host_gs_base, gs.base_address);
 }
 
-auto vcpu_t::host_ss() const noexcept -> seg_t<ss_t>
+auto vcpu_t::host_ss() const noexcept -> segment_t<ss_t>
 {
-  seg_t<ss_t> ss;
+  segment_t<ss_t> ss;
   vmx::vmread(vmx::vmcs_t::field::host_ss_selector, ss.selector);
   return ss;
 }
 
-void vcpu_t::host_ss(seg_t<ss_t> ss) noexcept
+void vcpu_t::host_ss(segment_t<ss_t> ss) noexcept
 {
   vmx::vmwrite(vmx::vmcs_t::field::host_ss_selector, ss.selector.index * 8);
 }
 
-auto vcpu_t::host_tr() const noexcept -> seg_t<tr_t>
+auto vcpu_t::host_tr() const noexcept -> segment_t<tr_t>
 {
-  seg_t<tr_t> tr;
+  segment_t<tr_t> tr;
   vmx::vmread(vmx::vmcs_t::field::host_tr_selector, tr.selector);
   vmx::vmread(vmx::vmcs_t::field::host_tr_base, tr.base_address);
   return tr;
 }
 
-void vcpu_t::host_tr(seg_t<tr_t> tr) noexcept
+void vcpu_t::host_tr(segment_t<tr_t> tr) noexcept
 {
   vmx::vmwrite(vmx::vmcs_t::field::host_tr_selector, tr.selector.index * 8);
   vmx::vmwrite(vmx::vmcs_t::field::host_tr_base, tr.base_address);

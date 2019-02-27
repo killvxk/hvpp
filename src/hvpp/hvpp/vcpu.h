@@ -77,7 +77,7 @@ enum class vcpu_state
   off,
 
   //
-  // VCPU is in VMX root mode; host & guest VMCS is being initialized.
+  // VCPU is in VMX-root mode; host & guest VMCS is being initialized.
   //
   initializing,
 
@@ -97,7 +97,7 @@ enum class vcpu_state
   terminating,
 
   //
-  // VCPU is terminated, VMX root mode has been left.
+  // VCPU is terminated, VMX-root mode has been left.
   //
   terminated,
 };
@@ -146,43 +146,60 @@ static_assert(sizeof(vcpu_stack_t::shadow_space_t) == 32);
 class vcpu_t
 {
   public:
-    auto initialize(vmexit_handler* handler = nullptr) noexcept -> error_code_t;
+    auto initialize(vmexit_handler& handler) noexcept -> error_code_t;
     void destroy() noexcept;
 
     void launch() noexcept;
     void terminate() noexcept;
 
-    auto exit_handler() const noexcept -> vmexit_handler*;
-    void exit_handler(vmexit_handler* handler) noexcept;
+    void ept_enable(uint16_t count = 1) noexcept;
+    void ept_disable() noexcept;
 
-    ept_t& ept() noexcept { return ept_; }
+    auto ept_index() noexcept -> uint16_t;
+    void ept_index(uint16_t index) noexcept;
 
-    context_t& exit_context() { return exit_context_; }
-    void suppress_rip_adjust() noexcept { suppress_rip_adjust_ = true; }
+    auto ept(uint16_t index = 0) noexcept -> ept_t&;
+
+    auto exit_context() noexcept -> context_t&;
+    void suppress_rip_adjust() noexcept;
 
     //
     // VMCS manipulation. Implementation is in vcpu.inl.
     //
 
   public:
-    auto exit_interrupt_info() const noexcept -> interrupt_info_t;
-    void inject(interrupt_info_t interrupt) noexcept;
+    //
+    // Make storage for up-to 16 pending interrupts.
+    // In practice I haven't seen more than 2 pending interrupts.
+    //
+    static constexpr int pending_interrupt_queue_size = 16;
+
+    auto interrupt_info() const noexcept -> interrupt_info_t;
+    auto idt_vectoring_info() const noexcept -> interrupt_info_t;
+
+    bool interrupt_inject(interrupt_info_t interrupt, bool first = false) noexcept;
+    void interrupt_inject_force(interrupt_info_t interrupt) noexcept;
+    void interrupt_inject_pending() noexcept;
+    bool interrupt_is_pending() const noexcept;
 
     auto exit_instruction_info_guest_va() const noexcept -> void*;
 
-  private:
     //
     // Control state
     //
 
   public:
+    //
+    // (publicly read-only fields)
+    //
+
     auto vcpu_id() const noexcept -> uint16_t;
+    auto ept_pointer() const noexcept -> ept_ptr_t;
+    auto vmcs_link_pointer() const noexcept -> pa_t;     // technically, this is guest state
 
   private:
     void vcpu_id(uint16_t virtual_processor_identifier) noexcept;
-    auto ept_pointer() const noexcept -> ept_ptr_t;
     void ept_pointer(ept_ptr_t ept_pointer) noexcept;
-    auto vmcs_link_pointer() const noexcept -> pa_t;     // technically, this is guest state
     void vmcs_link_pointer(pa_t link_pointer) noexcept;
 
   public:
@@ -246,10 +263,13 @@ class vcpu_t
     auto exit_interruption_info() const noexcept -> vmx::interrupt_info_t;
     auto exit_interruption_error_code() const noexcept -> exception_error_code_t;
 
+    auto exit_idt_vectoring_info() const noexcept -> vmx::interrupt_info_t;
+    auto exit_idt_vectoring_error_code() const noexcept -> exception_error_code_t;
+
     auto exit_reason() const noexcept -> vmx::exit_reason;
     auto exit_qualification() const noexcept -> vmx::exit_qualification_t;
     auto exit_guest_physical_address() const noexcept -> pa_t;
-    auto exit_guest_linear_address() const noexcept -> la_t;
+    auto exit_guest_linear_address() const noexcept -> va_t;
 
     //
     // Guest state
@@ -279,34 +299,37 @@ class vcpu_t
     auto guest_idtr() const noexcept -> idtr_t;
     void guest_idtr(idtr_t idtr) noexcept;
 
-    auto guest_cs() const noexcept -> seg_t<cs_t>;
-    void guest_cs(seg_t<cs_t> cs) noexcept;
-    auto guest_ds() const noexcept -> seg_t<ds_t>;
-    void guest_ds(seg_t<ds_t> ds) noexcept;
-    auto guest_es() const noexcept -> seg_t<es_t>;
-    void guest_es(seg_t<es_t> es) noexcept;
-    auto guest_fs() const noexcept -> seg_t<fs_t>;
-    void guest_fs(seg_t<fs_t> fs) noexcept;
-    auto guest_gs() const noexcept -> seg_t<gs_t>;
-    void guest_gs(seg_t<gs_t> gs) noexcept;
-    auto guest_ss() const noexcept -> seg_t<ss_t>;
-    void guest_ss(seg_t<ss_t> ss) noexcept;
-    auto guest_tr() const noexcept -> seg_t<tr_t>;
-    void guest_tr(seg_t<tr_t> tr) noexcept;
-    auto guest_ldtr() const noexcept -> seg_t<ldtr_t>;
-    void guest_ldtr(seg_t<ldtr_t> ldtr) noexcept;
+    auto guest_cs() const noexcept -> segment_t<cs_t>;
+    void guest_cs(segment_t<cs_t> cs) noexcept;
+    auto guest_ds() const noexcept -> segment_t<ds_t>;
+    void guest_ds(segment_t<ds_t> ds) noexcept;
+    auto guest_es() const noexcept -> segment_t<es_t>;
+    void guest_es(segment_t<es_t> es) noexcept;
+    auto guest_fs() const noexcept -> segment_t<fs_t>;
+    void guest_fs(segment_t<fs_t> fs) noexcept;
+    auto guest_gs() const noexcept -> segment_t<gs_t>;
+    void guest_gs(segment_t<gs_t> gs) noexcept;
+    auto guest_ss() const noexcept -> segment_t<ss_t>;
+    void guest_ss(segment_t<ss_t> ss) noexcept;
+    auto guest_tr() const noexcept -> segment_t<tr_t>;
+    void guest_tr(segment_t<tr_t> tr) noexcept;
+    auto guest_ldtr() const noexcept -> segment_t<ldtr_t>;
+    void guest_ldtr(segment_t<ldtr_t> ldtr) noexcept;
 
     auto guest_segment_base_address(int index) const noexcept -> void*;
     void guest_segment_base_address(int index, void* base_address) noexcept;
     auto guest_segment_limit(int index) const noexcept -> uint32_t;
     void guest_segment_limit(int index, uint32_t limit) noexcept;
-    auto guest_segment_access(int index) const noexcept -> seg_access_vmx_t;
-    void guest_segment_access(int index, seg_access_vmx_t access_rights) noexcept;
-    auto guest_segment_selector(int index) const noexcept -> seg_selector_t;
-    void guest_segment_selector(int index, seg_selector_t selector) noexcept;
+    auto guest_segment_access(int index) const noexcept -> segment_access_vmx_t;
+    void guest_segment_access(int index, segment_access_vmx_t access_rights) noexcept;
+    auto guest_segment_selector(int index) const noexcept -> segment_selector_t;
+    void guest_segment_selector(int index, segment_selector_t selector) noexcept;
 
-    auto guest_segment(int index) const noexcept -> seg_t<>;
-    void guest_segment(int index, seg_t<> seg) noexcept;
+    auto guest_segment(int index) const noexcept -> segment_t<>;
+    void guest_segment(int index, segment_t<> seg) noexcept;
+
+    auto guest_interruptibility_state() const noexcept -> vmx::interruptibility_state_t;
+    void guest_interruptibility_state(vmx::interruptibility_state_t interruptibility_state) noexcept;
 
   private:
     //
@@ -330,26 +353,26 @@ class vcpu_t
     auto host_idtr() const noexcept -> idtr_t;
     void host_idtr(idtr_t idtr) noexcept;
 
-    auto host_cs() const noexcept -> seg_t<cs_t>;
-    void host_cs(seg_t<cs_t> cs) noexcept;
-    auto host_ds() const noexcept -> seg_t<ds_t>;
-    void host_ds(seg_t<ds_t> ds) noexcept;
-    auto host_es() const noexcept -> seg_t<es_t>;
-    void host_es(seg_t<es_t> es) noexcept;
-    auto host_fs() const noexcept -> seg_t<fs_t>;
-    void host_fs(seg_t<fs_t> fs) noexcept;
-    auto host_gs() const noexcept -> seg_t<gs_t>;
-    void host_gs(seg_t<gs_t> gs) noexcept;
-    auto host_ss() const noexcept -> seg_t<ss_t>;
-    void host_ss(seg_t<ss_t> ss) noexcept;
-    auto host_tr() const noexcept -> seg_t<tr_t>;
-    void host_tr(seg_t<tr_t> tr) noexcept;
+    auto host_cs() const noexcept -> segment_t<cs_t>;
+    void host_cs(segment_t<cs_t> cs) noexcept;
+    auto host_ds() const noexcept -> segment_t<ds_t>;
+    void host_ds(segment_t<ds_t> ds) noexcept;
+    auto host_es() const noexcept -> segment_t<es_t>;
+    void host_es(segment_t<es_t> es) noexcept;
+    auto host_fs() const noexcept -> segment_t<fs_t>;
+    void host_fs(segment_t<fs_t> fs) noexcept;
+    auto host_gs() const noexcept -> segment_t<gs_t>;
+    void host_gs(segment_t<gs_t> gs) noexcept;
+    auto host_ss() const noexcept -> segment_t<ss_t>;
+    void host_ss(segment_t<ss_t> ss) noexcept;
+    auto host_tr() const noexcept -> segment_t<tr_t>;
+    void host_tr(segment_t<tr_t> tr) noexcept;
 
     //
-    // ldtr does not exist in VMX root mode.
+    // ldtr does not exist in VMX-root mode.
     //
-    // auto host_ldtr() const noexcept -> seg_t<ldtr_t>;
-    // void host_ldtr(seg_t<ldtr_t> ldtr)  noexcept;
+    // auto host_ldtr() const noexcept -> segment_t<ldtr_t>;
+    // void host_ldtr(segment_t<ldtr_t> ldtr)  noexcept;
     //
 
   private:
@@ -392,7 +415,18 @@ class vcpu_t
 
     vmexit_handler*    handler_;
     vcpu_state         state_;
-    ept_t              ept_;
+
+    ept_t*             ept_;
+    uint16_t           ept_count_;
+    uint16_t           ept_index_;
+
+    //
+    // Pending interrupt queue (FIFO).
+    //
+    interrupt_info_t   pending_interrupt_[pending_interrupt_queue_size];
+    uint8_t            pending_interrupt_first_;
+    uint8_t            pending_interrupt_count_;
+
     bool               suppress_rip_adjust_;
 };
 

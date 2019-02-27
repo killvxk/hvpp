@@ -3,6 +3,7 @@
 #include "hvpp/config.h"
 #include "hvpp/vcpu.h"
 
+#include "hvpp/lib/assert.h"
 #include "hvpp/lib/cr3_guard.h"
 #include "hvpp/lib/debugger.h"
 
@@ -14,6 +15,21 @@ namespace hvpp {
 
 static constexpr uint64_t vmcall_terminate_id  = 0xDEAD;
 static constexpr uint64_t vmcall_breakpoint_id = 0xAABB;
+
+namespace detail
+{
+  static bool is_syscall_instruction(const void* address) noexcept
+  {
+    static constexpr uint8_t opcode[] = { 0x0f, 0x05 };
+    return memcmp(address, opcode, sizeof(opcode)) == 0;
+  }
+
+  static bool is_sysret_instruction(const void* address) noexcept
+  {
+    static constexpr uint8_t opcode[] = { 0x48, 0x0f, 0x07 };
+    return memcmp(address, opcode, sizeof(opcode)) == 0;
+  }
+}
 
 void vmexit_passthrough_handler::setup(vcpu_t& vp) noexcept
 {
@@ -35,89 +51,31 @@ void vmexit_passthrough_handler::setup(vcpu_t& vp) noexcept
   auto gdtr = read<gdtr_t>();
   vp.guest_gdtr(gdtr);
   vp.guest_idtr(read<idtr_t>());
-  vp.guest_cs(seg_t{ gdtr, read<cs_t>() });
-  vp.guest_ds(seg_t{ gdtr, read<ds_t>() });
-  vp.guest_es(seg_t{ gdtr, read<es_t>() });
-  vp.guest_fs(seg_t{ gdtr, read<fs_t>() });
-  vp.guest_gs(seg_t{ gdtr, read<gs_t>() });
-  vp.guest_ss(seg_t{ gdtr, read<ss_t>() });
-  vp.guest_tr(seg_t{ gdtr, read<tr_t>() });
-  vp.guest_ldtr(seg_t{ gdtr, read<ldtr_t>() });
+  vp.guest_cs(segment_t{ gdtr, read<cs_t>() });
+  vp.guest_ds(segment_t{ gdtr, read<ds_t>() });
+  vp.guest_es(segment_t{ gdtr, read<es_t>() });
+  vp.guest_fs(segment_t{ gdtr, read<fs_t>() });
+  vp.guest_gs(segment_t{ gdtr, read<gs_t>() });
+  vp.guest_ss(segment_t{ gdtr, read<ss_t>() });
+  vp.guest_tr(segment_t{ gdtr, read<tr_t>() });
+  vp.guest_ldtr(segment_t{ gdtr, read<ldtr_t>() });
 }
 
-void vmexit_passthrough_handler::invoke_termination() noexcept
+void vmexit_passthrough_handler::invoke_termination(vcpu_t& vp) noexcept
 {
+  (void)(vp);
+
   vmx::vmcall(vmcall_terminate_id);
 }
 
 void vmexit_passthrough_handler::handle_exception_or_nmi(vcpu_t& vp) noexcept
 {
-  auto interrupt = vp.exit_interrupt_info();
+  handle_interrupt(vp);
+}
 
-  switch (interrupt.type())
-  {
-    case vmx::interrupt_type::hardware_exception:
-      switch (interrupt.vector())
-      {
-        case exception_vector::general_protection:
-
-#ifdef HVPP_ENABLE_VMWARE_WORKAROUND
-
-        {
-            //
-            // VMWare I/O backdoor (port 0x5658/0x5659) workaround.
-            //
-            cr3_guard _(vp.guest_cr3());
-
-            vmx::exit_qualification_io_instruction_t exit_qualification;
-            if (try_decode_io_instruction(vp.exit_context(), exit_qualification))
-            {
-              ia32_asm_io_with_context(exit_qualification, vp.exit_context());
-              return;
-            }
-          }
-
-#endif
-
-          break;
-
-        case exception_vector::page_fault:
-          write<cr2_t>(cr2_t{ vp.exit_qualification().linear_address });
-          break;
-
-        default:
-          break;
-      }
-      break;
-
-    case vmx::interrupt_type::software_exception:
-      switch (interrupt.vector())
-      {
-        case exception_vector::breakpoint:
-          break;
-
-        default:
-          break;
-      }
-      break;
-
-    default:
-      break;
-  }
-
-  //
-  // Just reinject the event.
-  //
-  vp.inject(interrupt);
-
-  //
-  // Do not increment rip by exit_instruction_length() in
-  // vcpu::entry_host().
-  //
-  // The RIP is controlled by entry_instruction_length()
-  // instead, which is taken from interrupt_info::rip_adjust().
-  //
-  vp.suppress_rip_adjust();
+void vmexit_passthrough_handler::handle_external_interrupt(vcpu_t& vp) noexcept
+{
+  handle_interrupt(vp);
 }
 
 void vmexit_passthrough_handler::handle_triple_fault(vcpu_t& vp) noexcept
@@ -132,6 +90,33 @@ void vmexit_passthrough_handler::handle_triple_fault(vcpu_t& vp) noexcept
     ia32_asm_pause();
     ia32_asm_halt();
   }
+}
+
+void vmexit_passthrough_handler::handle_interrupt_window(vcpu_t& vp) noexcept
+{
+  //
+  // Make sure there is an interrupt pending.
+  //
+  hvpp_assert(vp.interrupt_is_pending());
+
+  //
+  // Guest is in the interruptible state.
+  // Dequeue one pending interrupt from the queue
+  // and inject it.
+  //
+  vp.interrupt_inject_pending();
+
+  //
+  // If queue is empty, disable Interrupt-window exiting.
+  //
+  if (!vp.interrupt_is_pending())
+  {
+    auto procbased_ctls = vp.processor_based_controls();
+    procbased_ctls.interrupt_window_exiting = false;
+    vp.processor_based_controls(procbased_ctls);
+  }
+
+  vp.suppress_rip_adjust();
 }
 
 void vmexit_passthrough_handler::handle_execute_cpuid(vcpu_t& vp) noexcept
@@ -402,7 +387,7 @@ void vmexit_passthrough_handler::handle_mov_dr(vcpu_t& vp) noexcept
 
   if (vp.guest_cs().access.descriptor_privilege_level != 0)
   {
-    vp.inject(interrupt_info_t(vmx::interrupt_type::hardware_exception, exception_vector::general_protection, exception_error_code_t{}));
+    vp.interrupt_inject(interrupt_info_t(vmx::interrupt_type::hardware_exception, exception_vector::general_protection, exception_error_code_t{}));
     vp.suppress_rip_adjust();
     return;
   }
@@ -422,7 +407,7 @@ void vmexit_passthrough_handler::handle_mov_dr(vcpu_t& vp) noexcept
   {
     if (vp.guest_cr4().debugging_extensions)
     {
-      vp.inject(interrupt_info_t(vmx::interrupt_type::hardware_exception, exception_vector::invalid_opcode));
+      vp.interrupt_inject(interrupt_info_t(vmx::interrupt_type::hardware_exception, exception_vector::invalid_opcode));
       vp.suppress_rip_adjust();
       return;
     }
@@ -456,7 +441,7 @@ void vmexit_passthrough_handler::handle_mov_dr(vcpu_t& vp) noexcept
 
     write<dr6_t>(dr6);
 
-    vp.inject(interrupt_info_t(vmx::interrupt_type::hardware_exception, exception_vector::debug));
+    vp.interrupt_inject(interrupt_info_t(vmx::interrupt_type::hardware_exception, exception_vector::debug));
 
     auto dr7 = vp.guest_dr7();
     dr7.general_detect = false;
@@ -477,7 +462,7 @@ void vmexit_passthrough_handler::handle_mov_dr(vcpu_t& vp) noexcept
       exit_qualification.dr_number == 7) &&
       (gp_register >> 32) != 0)
   {
-    vp.inject(interrupt_info_t(vmx::interrupt_type::hardware_exception, exception_vector::general_protection, exception_error_code_t{}));
+    vp.interrupt_inject(interrupt_info_t(vmx::interrupt_type::hardware_exception, exception_vector::general_protection, exception_error_code_t{}));
     vp.suppress_rip_adjust();
     return;
   }
@@ -740,11 +725,11 @@ void vmexit_passthrough_handler::handle_gdtr_idtr_access(vcpu_t& vp) noexcept
 
   union
   {
-    gdtr_t gdtr;
-    idtr_t idtr;
-
     gdtr32_t gdtr32;
     idtr32_t idtr32;
+
+    gdtr64_t gdtr64;
+    idtr64_t idtr64;
   };
 
   cr3_guard _(vp.guest_cr3());
@@ -779,15 +764,15 @@ void vmexit_passthrough_handler::handle_gdtr_idtr_access(vcpu_t& vp) noexcept
   switch (instruction_info.instruction)
   {
     case vmx::instruction_info_gdtr_idtr_access_t::instruction_sgdt:
-      gdtr = vp.guest_gdtr();
-      memcpy(guest_va, &gdtr, guest_in_long_mode() ? sizeof(gdtr)
-                                                   : sizeof(gdtr32));
+      gdtr64 = vp.guest_gdtr();
+      memcpy(guest_va, &gdtr64, guest_in_long_mode() ? sizeof(gdtr64)
+                                                     : sizeof(gdtr32));
       break;
 
     case vmx::instruction_info_gdtr_idtr_access_t::instruction_sidt:
-      idtr = vp.guest_idtr();
-      memcpy(guest_va, &idtr, guest_in_long_mode() ? sizeof(idtr)
-                                                   : sizeof(idtr32));
+      idtr64 = vp.guest_idtr();
+      memcpy(guest_va, &idtr64, guest_in_long_mode() ? sizeof(idtr64)
+                                                     : sizeof(idtr32));
       break;
 
     //
@@ -798,13 +783,13 @@ void vmexit_passthrough_handler::handle_gdtr_idtr_access(vcpu_t& vp) noexcept
     //
 
     case vmx::instruction_info_gdtr_idtr_access_t::instruction_lgdt:
-      memcpy(&gdtr, guest_va, sizeof(gdtr));
-      vp.guest_gdtr(gdtr);
+      memcpy(&gdtr64, guest_va, sizeof(gdtr64));
+      vp.guest_gdtr(gdtr64);
       break;
 
     case vmx::instruction_info_gdtr_idtr_access_t::instruction_lidt:
-      memcpy(&idtr, guest_va, sizeof(idtr));
-      vp.guest_idtr(idtr);
+      memcpy(&idtr64, guest_va, sizeof(idtr64));
+      vp.guest_idtr(idtr64);
       break;
   }
 }
@@ -832,7 +817,7 @@ void vmexit_passthrough_handler::handle_ldtr_tr_access(vcpu_t& vp) noexcept
       break;
 
     case vmx::instruction_info_ldtr_tr_access_t::instruction_lldt:
-      vp.guest_segment_selector(context_t::seg_ldtr, seg_selector_t{ low_word });
+      vp.guest_segment_selector(context_t::seg_ldtr, segment_selector_t{ low_word });
       break;
 
     case vmx::instruction_info_ldtr_tr_access_t::instruction_ltr:
@@ -851,11 +836,11 @@ void vmexit_passthrough_handler::handle_ldtr_tr_access(vcpu_t& vp) noexcept
         //   LTR instruction sets busy bit in the TSS and we need to
         //   emulate this behavior.
         //
-        auto selector = seg_selector_t{ low_word };
+        auto selector = segment_selector_t{ low_word };
         vp.guest_segment_selector(context_t::seg_tr, selector);
 
         auto& descriptor = vp.guest_gdtr()[selector];
-        descriptor.access.type |= seg_access_t::type_tss_busy_flag;
+        descriptor.access.type |= segment_access_t::type_tss_busy_flag;
       }
       break;
   }
@@ -863,9 +848,6 @@ void vmexit_passthrough_handler::handle_ldtr_tr_access(vcpu_t& vp) noexcept
 
 void vmexit_passthrough_handler::handle_ept_violation(vcpu_t& vp) noexcept
 {
-  //
-  // TODO
-  //
   handle_fallback(vp);
 }
 
@@ -984,7 +966,7 @@ void vmexit_passthrough_handler::handle_execute_invpcid(vcpu_t& vp) noexcept
   return;
 
 inject_general_protection:
-  vp.inject(interrupt_info_t(vmx::interrupt_type::hardware_exception, exception_vector::general_protection, exception_error_code_t{}));
+  vp.interrupt_inject(interrupt_info_t(vmx::interrupt_type::hardware_exception, exception_vector::general_protection, exception_error_code_t{}));
   vp.suppress_rip_adjust();
 }
 
@@ -1026,9 +1008,241 @@ void vmexit_passthrough_handler::handle_execute_vmfunc(vcpu_t& vp) noexcept
 
 void vmexit_passthrough_handler::handle_vm_fallback(vcpu_t& vp) noexcept
 {
-  vp.inject(
+  vp.interrupt_inject(
     interrupt_info_t(vmx::interrupt_type::hardware_exception,
                      exception_vector::invalid_opcode));
+  vp.suppress_rip_adjust();
+}
+
+void vmexit_passthrough_handler::handle_interrupt(vcpu_t& vp) noexcept
+{
+  //
+  // Common code for handling all exceptions and interrupts.
+  //
+
+  auto interrupt = vp.interrupt_info();
+
+  switch (interrupt.type())
+  {
+    case vmx::interrupt_type::hardware_exception:
+      switch (interrupt.vector())
+      {
+        case exception_vector::invalid_opcode:
+          {
+            cr3_guard _(vp.guest_cr3());
+
+            if (detail::is_syscall_instruction(vp.exit_context().rip_as_pointer))
+            {
+              handle_emulate_syscall(vp);
+              vp.suppress_rip_adjust();
+              return;
+            }
+            else if (detail::is_sysret_instruction(vp.exit_context().rip_as_pointer))
+            {
+              handle_emulate_sysret(vp);
+              vp.suppress_rip_adjust();
+              return;
+            }
+          }
+          break;
+
+        case exception_vector::general_protection:
+
+#ifdef HVPP_ENABLE_VMWARE_WORKAROUND
+
+          {
+            //
+            // VMWare I/O backdoor (port 0x5658/0x5659) workaround.
+            //
+            cr3_guard _(vp.guest_cr3());
+
+            vmx::exit_qualification_io_instruction_t exit_qualification;
+            if (try_decode_io_instruction(vp.exit_context(), exit_qualification))
+            {
+              ia32_asm_io_with_context(exit_qualification, vp.exit_context());
+              return;
+            }
+          }
+
+#endif
+
+          break;
+
+        case exception_vector::page_fault:
+          write<cr2_t>(cr2_t{ vp.exit_qualification().linear_address });
+          break;
+
+        default:
+          break;
+      }
+      break;
+
+    case vmx::interrupt_type::software_exception:
+      switch (interrupt.vector())
+      {
+        case exception_vector::breakpoint:
+          break;
+
+        default:
+          break;
+      }
+      break;
+
+    default:
+      break;
+  }
+
+  //
+  // Just reinject the event.
+  //
+  vp.interrupt_inject(interrupt);
+
+  //
+  // Do not increment rip by exit_instruction_length() in
+  // vcpu::entry_host().
+  //
+  // The RIP is controlled by entry_instruction_length()
+  // instead, which is taken from interrupt_info::rip_adjust().
+  //
+  vp.suppress_rip_adjust();
+}
+
+//
+// SYSCALL/SYSRET emulation inspired by:
+//   https://revers.engineering/syscall-hooking-via-extended-feature-enable-register-efer/
+//
+
+void vmexit_passthrough_handler::handle_emulate_syscall(vcpu_t& vp) noexcept
+{
+  //
+  // Save the address of the instruction following SYSCALL
+  // into RCX and then load RIP from MSR_LSTAR.
+  //
+  auto lstar = msr::read<msr::lstar_t>();
+  vp.exit_context().rcx = vp.exit_context().rip + vp.exit_instruction_length();
+  vp.exit_context().rip = lstar;
+
+  //
+  // Save RFLAGS into R11 and then mask RFLAGS using MSR_FMASK.
+  //
+  auto fmask = msr::read<msr::fmask_t>();
+  vp.exit_context().r11 = vp.exit_context().rflags.flags;
+  vp.exit_context().rflags.flags &= ~fmask.flags;
+
+  //
+  // Load the CS and SS selectors with values derived from
+  // bits 47:32 of MSR_STAR.
+  //
+  auto star = msr::read<msr::star_t>();
+
+  //
+  // Verbose version of:
+  //   cs.access = segment_access_vmx_t{ 0xa09b };
+  //
+  // cs.access.type                       = segment_access_vmx_t::type_execute_read_accessed;
+  // cs.access.descriptor_type            = segment_access_vmx_t::descriptor_type_code_or_data;
+  // cs.access.descriptor_privilege_level = 0;                  // DPL0 == kernel mode
+  // cs.access.present                    = 1;
+  // // cs.access.limit_high              = 0;                  // Unchanged
+  // // cs.access.available_bit           = 0;                  // Unchanged
+  // cs.access.long_mode                  = 1;
+  // cs.access.default_big                = 0;
+  // cs.access.granularity                = segment_access_vmx_t::granularity_4kb;
+  //
+
+  auto cs = vp.guest_cs();
+  cs.base_address = nullptr;                                    // Flat segment
+  cs.limit        = uint32_t(0xffffffff);                       // 4GB limit
+  cs.access       = segment_access_vmx_t{ 0xa09b };             // L+DB+P+S+DPL0+Code
+  cs.selector     = cs_t{ uint16_t((star >> 32) & ~3) };        // STAR[47:32] & ~RPL3
+  vp.guest_cs(cs);
+
+  //
+  // Verbose version of:
+  //   ss.access = segment_access_vmx_t{ 0xc093 };
+  //
+  // ss.access.type                       = segment_access_vmx_t::type_read_write_accessed;
+  // ss.access.descriptor_type            = segment_access_vmx_t::descriptor_type_code_or_data;
+  // ss.access.descriptor_privilege_level = 0;                  // DPL0 == kernel mode
+  // ss.access.present                    = 1;
+  // // ss.access.limit_high              = 0;                  // Unchanged
+  // // ss.access.available_bit           = 0;                  // Unchanged
+  // // ss.access.long_mode               = 0;                  // Unchanged
+  // ss.access.default_big                = 1;
+  // ss.access.granularity                = segment_access_vmx_t::granularity_4kb;
+  //
+
+  auto ss = vp.guest_ss();
+  ss.base_address = nullptr;                                    // Flat segment
+  ss.limit        = uint32_t(0xffffffff);                       // 4GB limit
+  ss.access       = segment_access_vmx_t{ 0xc093 };             // G+DB+P+S+DPL0+Data
+  ss.selector     = ss_t{ uint16_t(((star >> 32) & ~3) + 8) };  // STAR[47:32] + 8
+  vp.guest_ss(ss);
+}
+
+void vmexit_passthrough_handler::handle_emulate_sysret(vcpu_t& vp) noexcept
+{
+  //
+  // Load RIP from RCX.
+  //
+  vp.exit_context().rip = vp.exit_context().rcx;
+
+  //
+  // Load RFLAGS from R11. Clear RF, VM, reserved bits.
+  //
+  vp.exit_context().rflags.flags = vp.exit_context().r11;
+  vp.exit_context().rflags.flags &= ~rflags_t::reserved_bits;
+  vp.exit_context().rflags.flags |=  rflags_t::fixed_bits;
+
+  //
+  // SYSRET loads the CS and SS selectors with values
+  // derived from bits 63:48 of MSR_STAR.
+  //
+  auto star = msr::read<msr::star_t>();
+
+  //
+  // Verbose version of:
+  //   cs.access = segment_access_vmx_t{ 0xa0fb };
+  //
+  // cs.access.type                       = segment_access_vmx_t::type_execute_read_accessed;
+  // cs.access.descriptor_type            = segment_access_vmx_t::descriptor_type_code_or_data;
+  // cs.access.descriptor_privilege_level = 3;                  // DPL3 == user mode
+  // cs.access.present                    = 1;
+  // // cs.access.limit_high              = 0;                  // Unchanged
+  // // cs.access.available_bit           = 0;                  // Unchanged
+  // cs.access.long_mode                  = 1;                  // Enforce return to long (64-bit) mode
+  // cs.access.default_big                = 0;
+  // cs.access.granularity                = segment_access_vmx_t::granularity_4kb;
+  //
+
+  auto cs = vp.guest_cs();
+  cs.base_address = nullptr;                                    // Flat segment
+  cs.limit        = uint32_t(0xffffffff);                       // 4GB limit
+  cs.access       = segment_access_vmx_t{ 0xa0fb };             // L+DB+P+S+DPL3+Code
+  cs.selector     = cs_t{ uint16_t(((star >> 48) + 16) | 3) };  // (STAR[63:48]+16) | 3 (* RPL forced to 3 *)
+  vp.guest_cs(cs);
+
+  //
+  // Verbose version of:
+  //   ss.access = segment_access_vmx_t{ 0xc0f3 };
+  //
+  // ss.access.type                       = segment_access_vmx_t::type_read_write_accessed;
+  // ss.access.descriptor_type            = segment_access_vmx_t::descriptor_type_code_or_data;
+  // ss.access.descriptor_privilege_level = 3;                  // DPL3 == user mode
+  // ss.access.present                    = 1;
+  // // ss.access.limit_high              = 0;                  // Unchanged
+  // // ss.access.available_bit           = 0;                  // Unchanged
+  // // ss.access.long_mode               = 0;                  // Unchanged
+  // ss.access.default_big                = 1;
+  // ss.access.granularity                = segment_access_vmx_t::granularity_4kb;
+  //
+
+  auto ss = vp.guest_ss();
+  ss.base_address = nullptr;                                    // Flat segment
+  ss.limit        = uint32_t(0xffffffff);                       // 4GB limit
+  ss.access       = segment_access_vmx_t{ 0xc0f3 };             // G+DB+P+S+DPL3+Data
+  ss.selector     = ss_t{ uint16_t(((star >> 48) + 8) | 3) };   // (STAR[63:48]+8) | 3 (* RPL forced to 3 *)
+  vp.guest_ss(ss);
 }
 
 }
